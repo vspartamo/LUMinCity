@@ -2,224 +2,188 @@ import numpy as np
 import pandas as pd
 import os
 
-# Cargar la base de datos inicial
-ruta = r"C:\\Users\\nicol\\OneDrive\\Escritorio\\LUMinCity\\LUMinCity"
-df_inicial = pd.read_csv(os.path.join(ruta, "base_inicial.csv"), sep=";")
+def configurar_parametros_modelo(num_agentes):
+    """Configura los parámetros del modelo para utilidades y posturas"""
+    # Parámetros para Choice Model (utilidad)
+    params = {
+        'beta_h_precio': np.random.normal(-0.5, 0.5, num_agentes),
+        'beta_h_sup': np.random.gamma(shape=2, scale=0.3, size=num_agentes),
+        'beta_h_sup_construida': np.random.gamma(shape=2, scale=0.3, size=num_agentes),
+        'beta_h_sup_construida_comercio': np.random.gamma(shape=2, scale=0.3, size=num_agentes),
+        'beta_h_sup_construida_industria': np.random.gamma(shape=2, scale=0.3, size=num_agentes),
+        'beta_h_tiempo': np.random.normal(-0.4, 0.1, num_agentes),
+        'beta_h_tipo': np.random.normal(0.3, 0.1, num_agentes),
+        'beta_h_sup_terreno': np.random.gamma(shape=2, scale=0.3, size=num_agentes),
+        'beta_h_nro_estaciones': np.random.normal(0.1, 0.05, num_agentes),
 
-# ======================== #
-# Parámetros y errores     #
-# ======================== #
-num_agentes = df_inicial['AGENTE_ID'].nunique()
-num_inmuebles = df_inicial['INMUEBLE'].nunique()
-num_zonas = df_inicial['ZONA'].nunique()
+        
+        # Parámetros para Bid Model (postura)
+        'alpha_h_sup': np.random.gamma(shape=2, scale=0.2, size=num_agentes),
+        'alpha_h_sup_construida': np.random.gamma(shape=2, scale=0.2, size=num_agentes),
+        'gamma_h_tiempo': np.random.normal(-0.3, 0.1, num_agentes),
+        'gamma_h_ingreso': np.random.lognormal(mean=-1.2, sigma=0.3, size=num_agentes),
+        'base_bid': np.random.lognormal(mean=2.5, sigma=0.5, size=num_agentes),
+        'gamma_h_comercio': np.random.normal(0.1, 0.05, num_agentes),
+        'gamma_h_estaciones': np.random.normal(0.2, 0.1, num_agentes),
+        'alpha_h_sup_terreno': np.random.gamma(shape=2, scale=0.2, size=num_agentes)
+    }
+    return params
 
-# Parámetros heterogéneos por agente para Choice
-beta_h_r = np.random.normal(-0.8, 0.2, num_agentes)   # Sensibilidad al precio
-beta_h_d = np.random.normal(0.5, 0.1, num_agentes)    # Sensibilidad a superficie
-beta_h_z = np.random.normal(1.2, 0.3, num_agentes)    # Sensibilidad a ingreso zona
-beta_h_a = np.random.normal(-0.7, 0.2, num_agentes)   # Sensibilidad a tiempo de viaje
-cvi = np.random.normal(2.5, 0.5, (num_inmuebles, num_zonas))  # Utilidad base
-
-# Parámetros heterogéneos para Bid
-alpha_h = np.random.normal(0.6, 0.1, num_agentes)     # Sensibilidad a superficie
-gamma_h_z = np.random.normal(0.8, 0.2, num_agentes)   # Sensibilidad a ingreso zona
-gamma_h_a = np.random.normal(-0.5, 0.1, num_agentes)  # Sensibilidad a tiempo de viaje
-bh = np.random.normal(5.0, 1.0, num_agentes)          # Disposición base a pagar
-
-# Función para errores Gumbel
 def generar_gumbel(size, mu=0, beta=1):
+    """Genera términos de error Gumbel para modelos logit"""
     U = np.random.uniform(0, 1, size=size)
     return mu - beta * np.log(-np.log(U))
 
-# Generar errores (escala 1 para logit)
-epsilon_choice = generar_gumbel((num_agentes, num_inmuebles, num_zonas), beta=1)
-epsilon_bid = generar_gumbel((num_agentes, num_inmuebles, num_zonas), beta=1)
-
-# ======================== #
-# Cálculo de utilidades y posturas
-# ======================== #
-def calcular_utilidades_posturas(df):
-    # Mapear índices únicos
+def calcular_utilidad(row, a_idx, params):
+    """Calcula la utilidad de un inmueble para un agente"""
+    error_choice = generar_gumbel(1)
+    return (
+        params['beta_h_precio'][a_idx] * row['precio'] +
+        params['beta_h_sup_terreno'][a_idx] * row['superficie_terreno'] +
+        params['beta_h_sup_construida'][a_idx] * row['superficie_construida'] +
+        params['beta_h_tiempo'][a_idx] * row['tiempo_viaje'] +
+        params['beta_h_tipo'][a_idx] * row['formato_inmueble'] +
+        params['beta_h_nro_estaciones'][a_idx] * row['nro_estaciones'] +
+        params['beta_h_sup_construida_comercio'][a_idx] * row['sup_comercio'] +
+        params['beta_h_sup_construida_industria'][a_idx] * row['sup_industria']+
+        error_choice        
+    )
+    
+def crear_dataframe_utilidades(df, params):
+    """Crea un dataframe mostrando siempre las 3 opciones por agente, con asignación realista"""
+    # 1. Clasificar inmuebles y contar disponibilidad
+    df['rango_precio'] = pd.qcut(df['precio'], q=3, labels=['bajo', 'medio', 'alto'])
+    disponibilidad = df['rango_precio'].value_counts().to_dict()
+    
+    # 2. Preparar datos
+    inmuebles_df = df.copy()
+    inmuebles_df['ocupado'] = False
+    asignaciones = {rango: 0 for rango in ['bajo', 'medio', 'alto']}
     agentes = df['AGENTE_ID'].unique()
-    inmuebles = df['INMUEBLE'].unique()
-    zonas = df['ZONA'].unique()
+    np.random.shuffle(agentes)
+    utilidades = []
     
-    # Crear arrays 3D
-    utilidades = np.zeros((num_agentes, num_inmuebles, num_zonas))
-    posturas = np.zeros((num_agentes, num_inmuebles, num_zonas))
+    # 3. Función para calcular utilidad hipotética (promedio de los disponibles)
+    def calcular_utilidad_hipotetica(agente_idx, rango):
+        muestra = inmuebles_df[inmuebles_df['rango_precio'] == rango].sample(min(5, disponibilidad[rango]))
+        if muestra.empty:
+            return np.nan
+        return np.mean([calcular_utilidad(row, agente_idx, params) for _, row in muestra.iterrows()])
     
-    for idx, row in df.iterrows():
-        a = np.where(agentes == row['AGENTE_ID'])[0][0]
-        v = np.where(inmuebles == row['INMUEBLE'])[0][0]
-        i = np.where(zonas == row['ZONA'])[0][0]
+    for agente_id in agentes:
+        agente_data = df[df['AGENTE_ID'] == agente_id].iloc[0]
+        a_idx = np.where(df['AGENTE_ID'].unique() == agente_id)[0][0]
         
-        # Calcular utilidad
-        utilidades[a,v,i] = (
-            cvi[v,i] +
-            beta_h_r[a] * row['PRECIO'] +
-            beta_h_d[a] * row['SUPERFICIE'] +
-            beta_h_z[a] * row['INGRESO_ZONA'] +
-            beta_h_a[a] * row['TIEMPO_VIAJE'] +
-            epsilon_choice[a,v,i]
-        )
+        opciones = {}
+        rango_elegido = None
         
-        # Calcular postura
-        posturas[a,v,i] = (
-            bh[a] +
-            alpha_h[a] * row['SUPERFICIE'] +
-            gamma_h_z[a] * row['INGRESO_ZONA'] +
-            gamma_h_a[a] * row['TIEMPO_VIAJE'] +
-            epsilon_bid[a,v,i]
-        )
-    
-    df['UTILIDAD'] = utilidades.reshape(-1)
-    df['POSTURA'] = posturas.reshape(-1)
-    return df
-
-df_con_calculos = calcular_utilidades_posturas(df_inicial)
-
-# ======================== #
-# Funciones de agrupación
-# ======================== #
-def categorizar(row, col_agrupar, rangos):
-    """Asigna un grupo según rangos personalizados."""
-    for grupo, (min_val, max_val) in rangos.items():
-        if min_val <= row[col_agrupar] < max_val:
-            return grupo
-    return 'fuera_de_rango'
-
-def agrupar_agentes_bid(df, col_agrupar="TIEMPO_VIAJE", rango_grupos={"bajo": (0,10), "medio": (10,20), "alto": (20,100)}):
-    """Agrupa agentes y calcula posturas por inmueble."""
-    df_g = df.copy()
-    df_g['GRUPO_AGENTE'] = df_g.apply(lambda x: categorizar(x, col_agrupar, rango_grupos), axis=1)
-    
-    # Calcular posturas por grupo
-    posturas = df_g.groupby(['INMUEBLE', 'ZONA', 'GRUPO_AGENTE']).agg({
-        'PRECIO': 'mean',
-        'SUPERFICIE': 'mean',
-        'INGRESO_ZONA': 'mean',
-        'TIEMPO_VIAJE': 'mean',
-        'POSTURA': 'mean'
-    }).reset_index()
-    
-    # Asignar inmueble al grupo con mayor postura
-    posturas['CHOICE'] = posturas.groupby(['INMUEBLE', 'ZONA'])['POSTURA'].transform('idxmax')
-    posturas['CHOICE'] = posturas.loc[posturas['CHOICE'], 'GRUPO_AGENTE'].values
-    
-    # Agregar TIEMPO_VIAJE desde el dataframe inicial
-    #posturas = posturas.merge(
-    #    df_inicial[['INMUEBLE', 'ZONA', 'TIEMPO_VIAJE']].drop_duplicates(),
-    #    on=['INMUEBLE', 'ZONA'],
-    #    how='left'
-    #)
-    
-    return posturas[['INMUEBLE', 'ZONA', 'PRECIO', 'SUPERFICIE', 'INGRESO_ZONA', 'TIEMPO_VIAJE', 'GRUPO_AGENTE', 'POSTURA', 'CHOICE']]
-
-def agrupar_inmuebles_choice(df, col_agrupar="PRECIO", rango_grupos={"bajo": (0,200000), "medio": (200000,400000), "alto": (400000,600000)}):
-    """Agrupa inmuebles y calcula elecciones por agente."""
-    df_g = df.copy()
-    df_g['GRUPO_INMUEBLE'] = df_g.apply(lambda x: categorizar(x, col_agrupar, rango_grupos), axis=1)
-    
-    # Calcular utilidades por grupo
-    utilidades = df_g.groupby(['AGENTE_ID', 'GRUPO_INMUEBLE']).agg({
-        'PRECIO': 'mean',
-        'SUPERFICIE': 'mean',
-        'INGRESO_ZONA': 'mean',
-        'TIEMPO_VIAJE': 'mean',
-        'UTILIDAD': 'mean'
-    }).reset_index()
-
-    # Asignar agente al grupo con mayor utilidad
-    utilidades['CHOICE'] = utilidades.groupby('AGENTE_ID')['UTILIDAD'].transform('idxmax')
-    utilidades['CHOICE'] = utilidades.loc[utilidades['CHOICE'], 'GRUPO_INMUEBLE'].values
-    
-    ## Agregar PRECIO, SUPERFICIE e INGRESO_ZONA desde el dataframe inicial
-    #utilidades = utilidades.merge(
-    #    df_inicial[['AGENTE_ID', 'PRECIO', 'SUPERFICIE', 'INGRESO_ZONA']].drop_duplicates(),
-    #    on='AGENTE_ID',
-    #    how='left'
-    #)
-    
-    return utilidades[['AGENTE_ID', 'PRECIO', 'SUPERFICIE', 'INGRESO_ZONA', 'TIEMPO_VIAJE', 'GRUPO_INMUEBLE', 'UTILIDAD', 'CHOICE']]
-
-# Función para transformar el DataFrame
-def transformar_df(df):
-    # Crear un DataFrame vacío para almacenar los resultados
-    resultado = pd.DataFrame(columns=[
-        "INMUEBLE", "ZONA", "PRECIO", "SUPERFICIE", "INGRESO_ZONA",
-        "TIEMPO_VIAJE_ALTO", "TIEMPO_VIAJE_MEDIO", "TIEMPO_VIAJE_BAJO",
-        "POSTURA_ALTO", "POSTURA_MEDIO", "POSTURA_BAJO", "CHOICE"
-    ])
-    
-    # Agrupar por INMUEBLE y ZONA
-    grupos = df.groupby(["INMUEBLE", "ZONA"])
-    
-    for (inmueble, zona), grupo in grupos:
-        # Extraer valores únicos
-        precio = grupo["PRECIO"].iloc[0]
-        superficie = grupo["SUPERFICIE"].iloc[0]
-        ingreso_zona = grupo["INGRESO_ZONA"].iloc[0]
-        choice = grupo["CHOICE"].iloc[0]
+        # Evaluar TODAS las opciones (aunque no estén disponibles)
+        for rango in ['bajo', 'medio', 'alto']:
+            # Opción disponible
+            if asignaciones[rango] < disponibilidad[rango]:
+                inmuebles_rango = inmuebles_df[
+                    (inmuebles_df['rango_precio'] == rango) & 
+                    (~inmuebles_df['ocupado'])]
+                
+                if not inmuebles_rango.empty:
+                    mejor_utilidad = -np.inf
+                    mejor_inmueble = None
+                    
+                    for _, inmueble in inmuebles_rango.iterrows():
+                        utilidad = calcular_utilidad(inmueble, a_idx, params)
+                        if utilidad > mejor_utilidad:
+                            mejor_utilidad = utilidad
+                            mejor_inmueble = inmueble
+                    
+                    opciones[rango] = {
+                        'inmueble': mejor_inmueble,
+                        'utilidad': mejor_utilidad,
+                        'disponible': True
+                    }
+            # Opción no disponible (cálculo hipotético)
+            else:
+                opciones[rango] = {
+                    'inmueble': None,
+                    'utilidad': calcular_utilidad_hipotetica(a_idx, rango),
+                    'disponible': False
+                }
         
-        # Inicializar valores para cada grupo de agentes
-        tiempo_viaje_alto = None
-        tiempo_viaje_medio = None
-        tiempo_viaje_bajo = None
-        postura_alto = None
-        postura_medio = None
-        postura_bajo = None
+        # Elegir solo entre opciones disponibles
+        opciones_disponibles = {k:v for k,v in opciones.items() if v['disponible']}
+        if opciones_disponibles:
+            rango_elegido = max(opciones_disponibles.keys(), 
+                              key=lambda x: opciones_disponibles[x]['utilidad'])
+            
+            # Marcar inmueble como ocupado si se eligió
+            if rango_elegido:
+                inmueble_elegido = opciones[rango_elegido]['inmueble']
+                inmuebles_df.loc[inmuebles_df['INMUEBLE_ID'] == inmueble_elegido['INMUEBLE_ID'], 'ocupado'] = True
+                asignaciones[rango_elegido] += 1
         
-        # Llenar los valores según el grupo de agentes
-        for _, fila in grupo.iterrows():
-            if fila["GRUPO_AGENTE"] == "alto":
-                tiempo_viaje_alto = fila["TIEMPO_VIAJE"]
-                postura_alto = fila["POSTURA"]
-            elif fila["GRUPO_AGENTE"] == "medio":
-                tiempo_viaje_medio = fila["TIEMPO_VIAJE"]
-                postura_medio = fila["POSTURA"]
-            elif fila["GRUPO_AGENTE"] == "bajo":
-                tiempo_viaje_bajo = fila["TIEMPO_VIAJE"]
-                postura_bajo = fila["POSTURA"]
-        
-        # Crear una nueva fila como DataFrame
-        nueva_fila = pd.DataFrame({
-            "INMUEBLE": [inmueble],
-            "ZONA": [zona],
-            "PRECIO": [precio],
-            "SUPERFICIE": [superficie],
-            "INGRESO_ZONA": [ingreso_zona],
-            "TIEMPO_VIAJE_ALTO": [tiempo_viaje_alto],
-            "TIEMPO_VIAJE_MEDIO": [tiempo_viaje_medio],
-            "TIEMPO_VIAJE_BAJO": [tiempo_viaje_bajo],
-            "POSTURA_ALTO": [postura_alto],
-            "POSTURA_MEDIO": [postura_medio],
-            "POSTURA_BAJO": [postura_bajo],
-            "CHOICE": [choice]
-        })
-        
-        # Concatenar la nueva fila al DataFrame resultado
-        resultado = pd.concat([resultado, nueva_fila], ignore_index=True)
+        # Registrar las 3 opciones
+        for rango in ['bajo', 'medio', 'alto']:
+            dato = opciones[rango]
+            if dato['inmueble'] is not None:
+                fila = {
+                    'AGENTE_ID': agente_id,
+                    'PRECIO': dato['inmueble']['precio'],
+                    'SUPERFICIE_CONSTRUIDA': dato['inmueble']['superficie_construida'],
+                    'INGRESO_HOGAR': agente_data['ingreso_hogar'],
+                    'MIEMBROS_HOGAR': agente_data['miembros_hogar'],
+                    'GRUPO_AGENTE': agente_data['grupo_agente'],
+                    'TIEMPO_VIAJE': dato['inmueble']['tiempo_viaje'],
+                    'NRO_ESTACIONES': agente_data['num_estaciones_metro'],
+                    'MACROZONA': agente_data['macro_zona'],
+                    'SUPERFICIE_TERRENO': dato['inmueble']['superficie_terreno'],
+                    'SUPERFICIE_COMERCIO': agente_data['sup_comercio'],
+                    'SUPERFICIE_INDUSTRIA': agente_data['sup_industria'],
+                    'GRUPO_INMUEBLE': rango,
+                    'UTILIDAD': dato['utilidad'],
+                    'CHOICE': 1 if rango == rango_elegido else 0,
+                    'DISPONIBLE': dato['disponible']
+                }
+            else:
+                # Para opciones no disponibles usamos valores promedio
+                fila = {
+                    'AGENTE_ID': agente_id,
+                    'PRECIO': inmuebles_df[inmuebles_df['rango_precio'] == rango]['precio'].mean(),
+                    'SUPERFICIE': inmuebles_df[inmuebles_df['rango_precio'] == rango]['superficie_construida'].mean(),
+                    'INGRESO_ZONA': agente_data['ingreso_hogar'],
+                    'TIEMPO_VIAJE': inmuebles_df[inmuebles_df['rango_precio'] == rango]['tiempo_viaje'].mean(),
+                    'GRUPO_INMUEBLE': rango,
+                    'UTILIDAD': dato['utilidad'],
+                    'CHOICE': 0,
+                    'DISPONIBLE': False
+                }
+            utilidades.append(fila)
     
-    return resultado
-# ======================== #
-# Ejecución y guardado
-# ======================== #
-# Agrupar agentes (Bid)
-grupos_bid = transformar_df(agrupar_agentes_bid(
-    df_con_calculos,
-    col_agrupar="TIEMPO_VIAJE",
-    rango_grupos={"bajo": (0,10), "medio": (10,20), "alto": (20,100)}
-))
+    return pd.DataFrame(utilidades)
+def main():
+    # Cargar datos
+    ruta = r"C:\\Users\\nicol\\OneDrive\\Escritorio\\LUMinCity\\LUMinCity"
+    df = pd.read_csv(os.path.join(ruta, "base_agentes_localizados.csv"), sep=";")
+    
+    # Configurar parámetros
+    num_agentes = df['AGENTE_ID'].nunique()
+    num_inmuebles = df['INMUEBLE_ID'].nunique()
+    num_zonas = df['ZONA_ID'].nunique()
+    
+    params = configurar_parametros_modelo(num_agentes)
+    
+    # Generar términos de error
+    epsilon_choice = generar_gumbel((num_agentes, num_inmuebles, num_zonas))
+    
+    # Crear dataframe de utilidades con elecciones
+    df_utilidades = crear_dataframe_utilidades(df, params)
+    
+    # Guardar resultados
+    df_utilidades.to_csv(os.path.join(ruta, "resultados_choice.csv"), index=False, sep=";")
+    
+    # Mostrar resumen
+    print("Registros en Choice:", len(df_utilidades))
+    print("\nEjemplo de registros Choice:")
+    print(df_utilidades[df_utilidades['AGENTE_ID'].isin([0,1])].head(6))
+    print("\n¡Proceso completado con éxito!")
 
-# Agrupar inmuebles (Choice)
-grupos_choice = agrupar_inmuebles_choice(
-    df_con_calculos,
-    col_agrupar="PRECIO",
-    rango_grupos={"bajo": (0,200000), "medio": (200000,400000), "alto": (400000,600000)}
-)
-
-# Guardar resultados
-grupos_bid.to_csv(os.path.join(ruta, "grupos_bid.csv"), index=False, sep=";")
-grupos_choice.to_csv(os.path.join(ruta, "grupos_choice.csv"), index=False, sep=";")
-
-print("¡Agrupaciones generadas exitosamente!")
+if __name__ == "__main__":
+    main()
